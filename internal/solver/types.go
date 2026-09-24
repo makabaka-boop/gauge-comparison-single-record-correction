@@ -60,3 +60,35 @@ type Result struct {
 	Values     Int64Map  `json:"values,omitempty"`
 	Conflict   *Conflict `json:"conflict,omitempty"`
 }
+
+// Correction 是纠错查询的结论：暂时移除疑似记录后，按原 id 顺序复核其余
+// 约束，判断只改这一条记录能否修复整张校准网。查询不修改原记录，也不改变
+// Solve 的核验结果。
+type Correction struct {
+	// Suspect 原样回显被查询的疑似记录。
+	Suspect Record `json:"suspect"`
+	// Status 为 StatusOtherConflict / StatusUndetermined /
+	// StatusSuggested / StatusOutOfRange 之一。
+	Status string `json:"status"`
+	// Message 用一句话说明结论（如“只改此条记录无法修复校准网”）。
+	Message string `json:"message"`
+	// OtherConflict 仅 Status 为 otherConflict 时给出：其余记录按原 id
+	// 顺序复核最先出现的另一条冲突及现有闭环证据。
+	OtherConflict *Conflict `json:"otherConflict,omitempty"`
+	// Fix 仅疑似记录两端在其余网络中连通时（suggested / outOfRange）给出。
+	Fix *Fix `json:"fix,omitempty"`
+}
+
+// Fix 是疑似记录两端连通时，由势能差唯一确定的应填值及其证据。
+type Fix struct {
+	// Delta 是唯一应填 delta：其余记录隐含的 value[to]-value[from]。
+	Delta int64 `json:"delta"`
+	// Diff 是与原值的差额：Delta - 原记录 delta。
+	Diff int64 `json:"diff"`
+	// Path 是其余记录构成的森林中 from→to 的有向路径，逐步符号见
+	// Steps；Path.Total 恒等于 Delta。
+	Path Path `json:"path"`
+	// Legal 表示 Delta 是否在既有 delta 取值范围内；为 false 时
+	// 本结构仅供证据参考，不构成修正建议。
+	Legal bool `json:"legal"`
+}

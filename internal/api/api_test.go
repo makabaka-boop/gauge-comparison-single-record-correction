@@ -202,11 +202,16 @@ func TestEmptyRecordsIsConsistent(t *testing.T) {
 
 func postCheck(t *testing.T, v any) *httptest.ResponseRecorder {
 	t.Helper()
+	return postTo(t, "/check", v)
+}
+
+func postTo(t *testing.T, path string, v any) *httptest.ResponseRecorder {
+	t.Helper()
 	raw, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/check", bytes.NewReader(raw))
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	NewHandler().ServeHTTP(rec, req)
@@ -250,4 +255,178 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(buf[pos:])
+}
+
+// ---- POST /correct ----
+
+func TestCorrectSuggested(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"G1", "G2", "G3"},
+		Records: []solver.Record{
+			{ID: "c1", From: "G1", To: "G2", Delta: 100},
+			{ID: "c2", From: "G2", To: "G3", Delta: 200},
+			{ID: "c3", From: "G1", To: "G3", Delta: 301}, // 抄错，应为 300
+		},
+		SuspectID: "c3",
+	}
+	rr := postTo(t, "/correct", req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var c solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Status != solver.StatusSuggested || c.Suspect.ID != "c3" {
+		t.Fatalf("correction = %+v", c)
+	}
+	if c.Fix == nil || c.Fix.Delta != 300 || c.Fix.Diff != -1 || !c.Fix.Legal {
+		t.Fatalf("fix = %+v, want delta 300 diff -1 legal", c.Fix)
+	}
+	// 返回路径之和必须等于建议值。
+	var stepSum int64
+	for _, s := range c.Fix.Path.Steps {
+		stepSum += s.SignedDelta
+	}
+	if stepSum != c.Fix.Delta || c.Fix.Path.Total != c.Fix.Delta {
+		t.Fatalf("path sum %d / total %d != suggested %d", stepSum, c.Fix.Path.Total, c.Fix.Delta)
+	}
+	if c.OtherConflict != nil || c.Message == "" {
+		t.Fatalf("unexpected conflict/empty message: %+v", c)
+	}
+
+	// 查询不影响原核验结果：/check 仍报 c3 矛盾。
+	rr2 := postCheck(t, Request{Standards: req.Standards, Records: req.Records})
+	var res solver.Result
+	if err := json.Unmarshal(rr2.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Consistent || res.Conflict.Record.ID != "c3" {
+		t.Fatalf("check result changed: %+v", res)
+	}
+}
+
+func TestCorrectOtherConflict(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"A", "B", "C"},
+		Records: []solver.Record{
+			{ID: "k1", From: "A", To: "B", Delta: 1},
+			{ID: "k2", From: "B", To: "C", Delta: 1},
+			{ID: "k3-bad", From: "A", To: "C", Delta: 9}, // 疑似
+			{ID: "k4-bad", From: "B", To: "A", Delta: 5}, // 移除 k3-bad 后仍矛盾
+		},
+		SuspectID: "k3-bad",
+	}
+	rr := postTo(t, "/correct", req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var c solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	// k1 隐含 A-B=1，即 B-A=-1；k4-bad 声称 5，是移除疑似记录后最先失效的记录。
+	if c.Status != solver.StatusOtherConflict || c.OtherConflict == nil ||
+		c.OtherConflict.Record.ID != "k4-bad" {
+		t.Fatalf("correction = %+v, want otherConflict at k4-bad", c)
+	}
+	if c.OtherConflict.ImpliedDelta != -1 || c.OtherConflict.Mismatch != 6 {
+		t.Fatalf("implied=%d mismatch=%d, want -1/6", c.OtherConflict.ImpliedDelta, c.OtherConflict.Mismatch)
+	}
+	if c.OtherConflict.Loop.Sum != -6 { // pathTotal -1 - recordDelta 5
+		t.Fatalf("loop sum = %d, want -6", c.OtherConflict.Loop.Sum)
+	}
+	if c.Fix != nil || !strings.Contains(c.Message, "只改此条记录无法修复") {
+		t.Fatalf("fix=%v message=%q", c.Fix, c.Message)
+	}
+}
+
+func TestCorrectUndetermined(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"A", "B", "C", "D"},
+		Records: []solver.Record{
+			{ID: "b1", From: "A", To: "B", Delta: 1},
+			{ID: "b2", From: "C", To: "D", Delta: 2},
+			{ID: "br", From: "B", To: "C", Delta: 5}, // 唯一桥边
+		},
+		SuspectID: "br",
+	}
+	rr := postTo(t, "/correct", req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var c solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Status != solver.StatusUndetermined || c.Fix != nil || c.OtherConflict != nil {
+		t.Fatalf("correction = %+v, want undetermined without fix/conflict", c)
+	}
+}
+
+func TestCorrectOutOfRange(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"A", "B", "C"},
+		Records: []solver.Record{
+			{ID: "o1", From: "A", To: "B", Delta: 1_000_000_000},
+			{ID: "o2", From: "B", To: "C", Delta: 1_000_000_000},
+			{ID: "o3", From: "A", To: "C", Delta: 0}, // 隐含 2*10^9，超界
+		},
+		SuspectID: "o3",
+	}
+	rr := postTo(t, "/correct", req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var c solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Status != solver.StatusOutOfRange || c.Fix == nil || c.Fix.Legal {
+		t.Fatalf("correction = %+v, want outOfRange with illegal fix", c)
+	}
+	if c.Fix.Delta != 2_000_000_000 {
+		t.Fatalf("fix delta = %d, want 2e9 as evidence", c.Fix.Delta)
+	}
+}
+
+func TestCorrectValidationErrorsAre422(t *testing.T) {
+	cases := map[string]string{
+		"missing suspectId": `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1}]}`,
+		"empty suspectId":   `{"standards":["A","B"],"records":[],"suspectId":""}`,
+		"unknown suspectId": `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1}],"suspectId":"nope"}`,
+		"unknown field":     `{"standards":["A","B"],"records":[],"suspectId":"r","bogus":1}`,
+		"unknown endpoint":  `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"X","delta":1}],"suspectId":"r"}`,
+		"too few standards": `{"standards":["A"],"records":[],"suspectId":"r"}`,
+		"malformed JSON":    `{not json`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/correct", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			NewHandler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+			}
+			var eb errorBody
+			if err := json.Unmarshal(rec.Body.Bytes(), &eb); err != nil || eb.Error == "" {
+				t.Fatalf("expected error body, got %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestCorrectMethodNotAllowed(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/correct") // 仅允许 POST
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", resp.StatusCode)
+	}
 }

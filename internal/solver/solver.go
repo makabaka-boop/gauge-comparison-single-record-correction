@@ -18,6 +18,24 @@ import (
 // 只有把两个分量真正连起来的记录才会进入森林 forest；已经同根的记录
 // 只做校验。这样森林中 from→to 的简单路径唯一，诊断给出的矛盾环也确定。
 func Solve(standards []string, records []Record) Result {
+	return propagate(standards, records).result
+}
+
+// propagation 保存一次约束传播的结论与内部状态。全部记录一致时 DSU 与森林
+// 覆盖全部记录，纠错查询据此做势能差推定；遇首个矛盾即中止，内部状态只
+// 覆盖此前已接受的记录。
+type propagation struct {
+	result    Result
+	d         *dsu
+	ordered   []Record // records 按 id 字节序排序后的副本
+	adj       [][]adjEdge
+	index     map[string]int
+	standards []string
+}
+
+// propagate 是约束传播的实现主体，供 Solve 与 Correct 复用。
+// 不修改 records：内部复制后再排序。
+func propagate(standards []string, records []Record) *propagation {
 	index := make(map[string]int, len(standards))
 	for i, s := range standards {
 		index[s] = i
@@ -31,29 +49,15 @@ func Solve(standards []string, records []Record) Result {
 	})
 
 	n := len(standards)
-	parent := make([]int, n)
-	size := make([]int, n)
-	// pot[x] = value[x] - value[parent(x)]；根的 pot 恒为 0。
-	pot := make([]int64, n)
-	for i := range parent {
-		parent[i] = i
-		size[i] = 1
+	d := &dsu{parent: make([]int, n), size: make([]int, n), pot: make([]int64, n)}
+	for i := range d.parent {
+		d.parent[i] = i
+		d.size[i] = 1
 	}
 
-	var find func(int) int
-	find = func(x int) int {
-		if parent[x] == x {
-			return x
-		}
-		p := parent[x]
-		root := find(p)
-		pot[x] += pot[p] // 路径压缩后 pot[x] 直连根：value[x] - value[root]
-		parent[x] = root
-		return root
-	}
-
-	// forest 仅由“连接两个不同分量”的已接受记录构成，因此始终是森林。
+	// adj 仅由“连接两个不同分量”的已接受记录构成，因此始终是森林。
 	adj := make([][]adjEdge, n)
+	p := &propagation{d: d, ordered: ordered, adj: adj, index: index, standards: standards}
 
 	for ri := range ordered {
 		rec := ordered[ri]
@@ -62,18 +66,19 @@ func Solve(standards []string, records []Record) Result {
 		// 自比较：value[x] - value[x] 必须为 0，否则当场矛盾。
 		if a == b {
 			if rec.Delta != 0 {
-				return Result{Consistent: false, Conflict: selfConflict(rec)}
+				p.result = Result{Consistent: false, Conflict: selfConflict(rec)}
+				return p
 			}
 			continue
 		}
 
-		ra, rb := find(a), find(b)
+		ra, rb := d.find(a), d.find(b)
 		if ra == rb {
 			// 同分量：隐含差值 value[b]-value[a] 为 pot[b] - pot[a]。
-			implied := pot[b] - pot[a]
+			implied := d.pot[b] - d.pot[a]
 			if implied != rec.Delta {
 				path := forestPath(a, b, adj, ordered, standards)
-				return Result{
+				p.result = Result{
 					Consistent: false,
 					Conflict: &Conflict{
 						Record:       rec,
@@ -88,12 +93,13 @@ func Solve(standards []string, records []Record) Result {
 						},
 					},
 				}
+				return p
 			}
 			continue
 		}
 
 		// 合并两个分量并维护势能。
-		link(a, b, ra, rb, rec.Delta, parent, size, pot)
+		d.link(a, b, ra, rb, rec.Delta)
 
 		// 不论 ra/rb 谁挂到谁下，边在无向森林中都是同一条。
 		adj[a] = append(adj[a], adjEdge{to: b, ri: ri})
@@ -104,7 +110,7 @@ func Solve(standards []string, records []Record) Result {
 	rootOf := make([]int, n)
 	rootMin := map[int]int{} // 各分量（以根为键）最小标准件的节点下标
 	for i := range standards {
-		r := find(i)
+		r := d.find(i)
 		rootOf[i] = r
 		if cur, ok := rootMin[r]; !ok || standards[i] < standards[cur] {
 			rootMin[r] = i
@@ -116,28 +122,52 @@ func Solve(standards []string, records []Record) Result {
 		z := rootMin[rootOf[i]]
 		// 同根：pot[i] = value[i]-value[root]，pot[z] 同理，
 		// 相对零点值 value[i]-value[z] = pot[i] - pot[z]。
-		values[s] = pot[i] - pot[z]
+		values[s] = d.pot[i] - d.pot[z]
 	}
 
-	return Result{Consistent: true, Values: values}
+	p.result = Result{Consistent: true, Values: values}
+	return p
+}
+
+// dsu 是带势能的并查集。find(x) 路径压缩后
+//
+//	pot[x] == value[x] - value[root(x)]
+//
+// 根的 pot 恒为 0；因此任意两同根节点满足
+// value[b] - value[a] == pot[b] - pot[a]。
+type dsu struct {
+	parent []int
+	size   []int
+	pot    []int64 // pot[x] = value[x] - value[parent(x)]
+}
+
+func (d *dsu) find(x int) int {
+	if d.parent[x] == x {
+		return x
+	}
+	p := d.parent[x]
+	root := d.find(p)
+	d.pot[x] += d.pot[p] // 路径压缩后 pot[x] 直连根：value[x] - value[root]
+	d.parent[x] = root
+	return root
 }
 
 // link 按大小合并两个分量并维护势能。约束：value[b] - value[a] = delta。
-func link(a, b, ra, rb int, delta int64, parent, size []int, pot []int64) {
+func (d *dsu) link(a, b, ra, rb int, delta int64) {
 	// find 之后 pot[a] = value[a] - value[ra]，pot[b] = value[b] - value[rb]。
-	if size[ra] >= size[rb] {
+	if d.size[ra] >= d.size[rb] {
 		// rb 挂到 ra 下，令 pot[rb] = value[rb] - value[ra]
 		// = (value[b] - pot[b]) - (value[a] - pot[a])
 		// = delta + pot[a] - pot[b]。
-		parent[rb] = ra
-		pot[rb] = delta + pot[a] - pot[b]
-		size[ra] += size[rb]
+		d.parent[rb] = ra
+		d.pot[rb] = delta + d.pot[a] - d.pot[b]
+		d.size[ra] += d.size[rb]
 	} else {
 		// ra 挂到 rb 下，令 pot[ra] = value[ra] - value[rb]
 		// = pot[b] - pot[a] - delta。
-		parent[ra] = rb
-		pot[ra] = pot[b] - pot[a] - delta
-		size[rb] += size[ra]
+		d.parent[ra] = rb
+		d.pot[ra] = d.pot[b] - d.pot[a] - delta
+		d.size[rb] += d.size[ra]
 	}
 }
 

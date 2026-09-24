@@ -1,5 +1,5 @@
 // Package api 提供纯后端 JSON API：POST /check 校验比较记录构成的校准网，
-// GET /healthz 做存活检查。
+// POST /correct 对指定疑似记录做纠错查询，GET /healthz 做存活检查。
 package api
 
 import (
@@ -26,6 +26,13 @@ type Request struct {
 	Records   []solver.Record `json:"records"`
 }
 
+// CorrectRequest 是 /correct 的请求体：在 /check 输入之外指定疑似记录 id。
+type CorrectRequest struct {
+	Standards []string        `json:"standards"`
+	Records   []solver.Record `json:"records"`
+	SuspectID string          `json:"suspectId"`
+}
+
 // NewHandler 构造 API 的路由处理器。
 func NewHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -33,20 +40,14 @@ func NewHandler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /check", handleCheck)
+	mux.HandleFunc("POST /correct", handleCorrect)
 	return mux
 }
 
 func handleCheck(w http.ResponseWriter, r *http.Request) {
 	var req Request
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid JSON body: "+err.Error())
-		return
-	}
-	// 请求体中只允许一个 JSON 值。
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusUnprocessableEntity, "request body must contain a single JSON object")
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 
@@ -58,17 +59,66 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, solver.Solve(req.Standards, req.Records))
 }
 
+func handleCorrect(w http.ResponseWriter, r *http.Request) {
+	var req CorrectRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	if err := validateInput(req.Standards, req.Records); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if req.SuspectID == "" {
+		writeError(w, http.StatusUnprocessableEntity, "suspectId: must be non-empty")
+		return
+	}
+
+	c, err := solver.Correct(req.Standards, req.Records, req.SuspectID, maxDelta)
+	if errors.Is(err, solver.ErrUnknownRecord) {
+		writeError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("suspectId %q is not a known record id", req.SuspectID))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, c)
+}
+
+// decodeBody 解码请求体中的单个 JSON 值；结构非法时返回错误。
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	// 请求体中只允许一个 JSON 值。
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("request body must contain a single JSON object")
+	}
+	return nil
+}
+
 // Validate 只做结构与范围校验，不进入任何数值约束传播。
 func Validate(req Request) error {
-	if len(req.Standards) < minStandards {
+	return validateInput(req.Standards, req.Records)
+}
+
+// validateInput 是 /check 与 /correct 共用的结构与范围校验。
+func validateInput(standards []string, records []solver.Record) error {
+	if len(standards) < minStandards {
 		return fmt.Errorf("standards: need at least %d ids", minStandards)
 	}
-	if len(req.Standards) > maxStandards {
+	if len(standards) > maxStandards {
 		return fmt.Errorf("standards: at most %d ids allowed", maxStandards)
 	}
 
-	seen := make(map[string]struct{}, len(req.Standards))
-	for _, id := range req.Standards {
+	seen := make(map[string]struct{}, len(standards))
+	for _, id := range standards {
 		if !isGraphicASCII(id) {
 			return fmt.Errorf("standards: id %q must be non-empty printable ASCII (0x21-0x7e)", id)
 		}
@@ -78,12 +128,12 @@ func Validate(req Request) error {
 		seen[id] = struct{}{}
 	}
 
-	if len(req.Records) > maxRecords {
+	if len(records) > maxRecords {
 		return fmt.Errorf("records: at most %d comparisons allowed", maxRecords)
 	}
 
-	recIDs := make(map[string]struct{}, len(req.Records))
-	for i, rec := range req.Records {
+	recIDs := make(map[string]struct{}, len(records))
+	for i, rec := range records {
 		if rec.ID == "" {
 			return fmt.Errorf("records[%d]: id must be non-empty", i)
 		}
