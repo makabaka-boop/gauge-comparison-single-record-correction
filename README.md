@@ -106,6 +106,44 @@ delta 越界等）返回 **422**，且不进入任何计算。
 （`signedDelta = -delta`），所以逐步 `signedDelta` 累加必然等于 `total`。
 自比较矛盾（`from == to` 且 delta 非 0）时路径为空，环退化为单点环。
 
+### `POST /correct`
+
+纠错查询：怀疑某条记录的 delta 抄错时，评估“只改这一条”能否修复整网。
+请求字段在 `/check` 之外增加 `suspectId`（必须引用已有记录 id，否则 422）。
+查询为只读：不改动 records，也不影响 `/check` 的核验结果。
+
+处理流程：暂时移除疑似记录，按原 id 字节序复核其余约束，再据连通性判定。
+响应（HTTP 200）按 `status` 区分：
+
+| `status` | 含义 |
+| --- | --- |
+| `fixed` | 其余记录一致且两端连通：`suggestedDelta` 为唯一应填值（势能差，在既有取值范围内），`deltaChange` 为与原值的差额，`path` 给出森林路径与逐步符号 |
+| `stillConflicting` | 其余记录仍矛盾：`conflict` 给出最先失效的另一条记录及闭环证据，`note` 明确单改此条无效 |
+| `underdetermined` | 其余记录一致但疑似记录两端不连通，差值无法唯一推定 |
+| `outOfRange` | 唯一应填值超出既有 delta 取值范围，不提供非法修正建议（`impliedDelta` 与 `path` 仍给出供复核） |
+
+示例（`fixed`）：
+
+```json
+{
+  "suspect": {"id": "r3", "from": "A", "to": "C", "delta": 999},
+  "status": "fixed",
+  "note": "其余记录一致：唯一应填差值 5（原值 999，差额 -994），单改此条即可修复整网",
+  "impliedDelta": 5,
+  "suggestedDelta": 5,
+  "deltaChange": -994,
+  "path": {
+    "from": "A", "to": "C",
+    "steps": [
+      {"recordId": "r1", "from": "A", "to": "B", "direction": "forward", "signedDelta": 2},
+      {"recordId": "r2", "from": "B", "to": "C", "direction": "forward", "signedDelta": 3}
+    ],
+    "runningTotal": [2, 5],
+    "total": 5
+  }
+}
+```
+
 ## 算法要点
 
 - **带势能并查集**：`pot[x] = value[x] - value[parent]`，路径压缩时累加势能；
@@ -131,4 +169,8 @@ go test -race ./...
   首条失效记录，并逐步复核路径方向、符号、累计差与闭合环；
 - 反向边、平行比较、自比较、输入乱序、记录 id 的 UTF-8 字节序；
 - 2000 标准件 / 6000 记录的大规模场景；
-- HTTP 层全部结构错误均为 422。
+- HTTP 层全部结构错误均为 422；
+- 纠错查询：用**独立图遍历**（每条无向记录展开为 forward/reverse
+  两条有向边的 BFS 势能传播 + 朴素带权并查集）核对反向边、平行边、
+  自比较、桥边（差值无法推定）、多处矛盾（单改无效）与越界不建议修正，
+  并验证返回路径逐步带符号之和等于 `suggestedDelta`。

@@ -213,6 +213,196 @@ func postCheck(t *testing.T, v any) *httptest.ResponseRecorder {
 	return rec
 }
 
+// ---- POST /correct ----
+
+func postCorrect(t *testing.T, v any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/correct", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestCorrectFixed(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"G1", "G2", "G3"},
+		Records: []solver.Record{
+			{ID: "c1", From: "G1", To: "G2", Delta: 100},
+			{ID: "c2", From: "G2", To: "G3", Delta: 200},
+			{ID: "c3", From: "G1", To: "G3", Delta: 999},
+		},
+		SuspectID: "c3",
+	}
+	rr := postCorrect(t, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var corr solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &corr); err != nil {
+		t.Fatal(err)
+	}
+	if corr.Status != solver.CorrectionFixed {
+		t.Fatalf("status = %s", corr.Status)
+	}
+	if corr.SuggestedDelta == nil || *corr.SuggestedDelta != 300 {
+		t.Fatalf("suggested = %v, want 300", corr.SuggestedDelta)
+	}
+	if corr.ImpliedDelta == nil || *corr.ImpliedDelta != 300 {
+		t.Fatalf("implied = %v, want 300", corr.ImpliedDelta)
+	}
+	if corr.DeltaChange == nil || *corr.DeltaChange != 300-999 {
+		t.Fatalf("deltaChange = %v, want %d", corr.DeltaChange, 300-999)
+	}
+	if corr.Path == nil {
+		t.Fatal("missing forest path")
+	}
+	// 路径之和必须等于建议值。
+	var sum int64
+	for _, s := range corr.Path.Steps {
+		sum += s.SignedDelta
+	}
+	if sum != *corr.SuggestedDelta || corr.Path.Total != *corr.SuggestedDelta {
+		t.Fatalf("path sum %d total %d, want %d", sum, corr.Path.Total, *corr.SuggestedDelta)
+	}
+	if corr.Conflict != nil {
+		t.Fatal("fixed result must not carry a conflict")
+	}
+}
+
+func TestCorrectStillConflicting(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"G1", "G2", "G3"},
+		Records: []solver.Record{
+			{ID: "c1", From: "G1", To: "G2", Delta: 100},
+			{ID: "c2", From: "G2", To: "G3", Delta: 200},
+			{ID: "c3", From: "G1", To: "G3", Delta: 999}, // 疑似
+			{ID: "c4", From: "G1", To: "G2", Delta: 101}, // 另一处坏记录
+		},
+		SuspectID: "c3",
+	}
+	rr := postCorrect(t, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var corr solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &corr); err != nil {
+		t.Fatal(err)
+	}
+	if corr.Status != solver.CorrectionStillConflicting {
+		t.Fatalf("status = %s, want stillConflicting", corr.Status)
+	}
+	if corr.Conflict == nil || corr.Conflict.Record.ID != "c4" {
+		t.Fatalf("conflict = %+v, want c4", corr.Conflict)
+	}
+	if corr.Conflict.Loop.Sum == 0 {
+		t.Fatal("loop evidence must be nonzero")
+	}
+	if corr.SuggestedDelta != nil || corr.Path != nil {
+		t.Fatal("stillConflicting must not suggest a fix")
+	}
+}
+
+func TestCorrectUnderdetermined(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"G1", "G2", "G3", "G4"},
+		Records: []solver.Record{
+			{ID: "c1", From: "G1", To: "G2", Delta: 1},
+			{ID: "br", From: "G2", To: "G3", Delta: 7}, // 桥边，疑似但无法推定
+			{ID: "c2", From: "G3", To: "G4", Delta: 2},
+		},
+		SuspectID: "br",
+	}
+	rr := postCorrect(t, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var corr solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &corr); err != nil {
+		t.Fatal(err)
+	}
+	if corr.Status != solver.CorrectionUnderdetermined {
+		t.Fatalf("status = %s, want underdetermined", corr.Status)
+	}
+	if corr.SuggestedDelta != nil || corr.Path != nil || corr.Conflict != nil {
+		t.Fatal("underdetermined must not carry suggestion/path/conflict")
+	}
+}
+
+func TestCorrectOutOfRangeDoesNotSuggestIllegalFix(t *testing.T) {
+	req := CorrectRequest{
+		Standards: []string{"G1", "G2", "G3"},
+		Records: []solver.Record{
+			{ID: "c1", From: "G1", To: "G2", Delta: 1_000_000_000},
+			{ID: "c2", From: "G2", To: "G3", Delta: 1_000_000_000},
+			{ID: "c3", From: "G1", To: "G3", Delta: 5},
+		},
+		SuspectID: "c3",
+	}
+	rr := postCorrect(t, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	var corr solver.Correction
+	if err := json.Unmarshal(rr.Body.Bytes(), &corr); err != nil {
+		t.Fatal(err)
+	}
+	if corr.Status != solver.CorrectionOutOfRange {
+		t.Fatalf("status = %s, want outOfRange", corr.Status)
+	}
+	if corr.SuggestedDelta != nil || strings.Contains(body, "suggestedDelta") {
+		t.Fatal("out-of-range response must not suggest a delta")
+	}
+	if corr.ImpliedDelta == nil || *corr.ImpliedDelta != 2_000_000_000 {
+		t.Fatalf("implied = %v, want 2000000000", corr.ImpliedDelta)
+	}
+	if corr.Path == nil || corr.Path.Total != 2_000_000_000 {
+		t.Fatalf("path total = %v, want 2000000000", corr.Path)
+	}
+}
+
+func TestCorrectRequestErrorsAre422(t *testing.T) {
+	cases := map[string]string{
+		"missing suspectId":  `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1}]}`,
+		"empty suspectId":    `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1}],"suspectId":""}`,
+		"unknown suspectId":  `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1}],"suspectId":"x"}`,
+		"unknown field":      `{"standards":["A","B"],"records":[],"suspectId":"r","bogus":1}`,
+		"bad standard refs":  `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"X","delta":1}],"suspectId":"r"}`,
+		"delta out of range": `{"standards":["A","B"],"records":[{"id":"r","from":"A","to":"B","delta":1000000001}],"suspectId":"r"}`,
+		"two JSON values":    `{"standards":["A","B"],"records":[],"suspectId":"r"}{}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/correct", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			NewHandler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestCorrectMethodNotAllowed(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/correct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
 // jsonStandards 构造一个规模测试请求：n 个标准件、m 条全部合法但可能超限的记录。
 func jsonStandards(n, m int) string {
 	var b strings.Builder

@@ -3,6 +3,10 @@
 // 还原可直接对照的有向路径。
 package solver
 
+// MaxDelta 是单条记录 delta 的既有合法取值上限（按绝对值计）。
+// 纠错查询不得建议超出 [-MaxDelta, MaxDelta] 的非法修正值。
+const MaxDelta = 1_000_000_000
+
 // Record 是一条比较记录，固定含义：value[to] - value[from] = Delta。
 type Record struct {
 	ID    string `json:"id"`
@@ -59,4 +63,45 @@ type Result struct {
 	Consistent bool      `json:"consistent"`
 	Values     Int64Map  `json:"values,omitempty"`
 	Conflict   *Conflict `json:"conflict,omitempty"`
+}
+
+// Correction 的状态取值。
+const (
+	// CorrectionFixed ：移除疑似记录后其余记录一致且两端连通，
+	// 存在唯一应填 delta，单改此条即可修复整网。
+	CorrectionFixed = "fixed"
+	// CorrectionStillConflicting ：移除疑似记录后其余记录仍矛盾，
+	// 单改此条无效。
+	CorrectionStillConflicting = "stillConflicting"
+	// CorrectionUnderdetermined ：其余记录一致，但疑似记录两端分属
+	// 不同连通分量，差值无法唯一推定。
+	CorrectionUnderdetermined = "underdetermined"
+	// CorrectionOutOfRange ：唯一应填 delta 超出既有取值范围，
+	// 不提供非法修正建议。
+	CorrectionOutOfRange = "outOfRange"
+)
+
+// Correction 是“只改疑似记录能否修复整网”的查询结论。
+// 查询为纯计算，不改动任何输入记录，也不影响 Solve 的核验结果。
+type Correction struct {
+	Suspect Record `json:"suspect"`
+	Status  string `json:"status"`
+	// Note 面向复核员的结论说明。
+	Note string `json:"note"`
+
+	// ImpliedDelta 在 fixed/outOfRange 时给出：其余记录隐含的唯一
+	// value[to]-value[from]（势能差）。
+	ImpliedDelta *int64 `json:"impliedDelta,omitempty"`
+	// SuggestedDelta 仅在 fixed 时给出：合法取值范围内的建议修正值，
+	// 等于 ImpliedDelta。
+	SuggestedDelta *int64 `json:"suggestedDelta,omitempty"`
+	// DeltaChange = SuggestedDelta - Suspect.Delta；0 表示原值本就正确。
+	DeltaChange *int64 `json:"deltaChange,omitempty"`
+
+	// Path 为其余记录构成的森林中 suspect.From → suspect.To 的唯一路径，
+	// 含逐步方向与符号（fixed/outOfRange 时给出；自比较为空路径）。
+	Path *Path `json:"path,omitempty"`
+	// Conflict 在 stillConflicting 时给出：其余记录中最先失效的另一条
+	// 记录及其闭环证据。
+	Conflict *Conflict `json:"conflict,omitempty"`
 }

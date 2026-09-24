@@ -18,12 +18,33 @@ import (
 // 只有把两个分量真正连起来的记录才会进入森林 forest；已经同根的记录
 // 只做校验。这样森林中 from→to 的简单路径唯一，诊断给出的矛盾环也确定。
 func Solve(standards []string, records []Record) Result {
+	nw := newNetwork(standards, records)
+	if c := nw.absorb(); c != nil {
+		return Result{Consistent: false, Conflict: c}
+	}
+	return Result{Consistent: true, Values: nw.relativeValues()}
+}
+
+// network 是一次约束传播的中间状态：带势能并查集 + 由“真正连接两个分量”的
+// 已接受记录构成的无向森林。Solve 与 Correct 共用同一套传播逻辑。
+type network struct {
+	standards []string
+	index     map[string]int
+	ordered   []Record // 按记录 id 的 UTF-8 字节序
+	parent    []int
+	size      []int
+	pot       []int64 // pot[x] = value[x] - value[parent(x)]；根的 pot 恒为 0
+	adj       [][]adjEdge
+}
+
+// newNetwork 复制 records 并按 id 字节序排序（不改动调用方切片），
+// 初始化每个标准件自成分量的并查集。
+func newNetwork(standards []string, records []Record) *network {
 	index := make(map[string]int, len(standards))
 	for i, s := range standards {
 		index[s] = i
 	}
 
-	// 按记录 id 的 UTF-8 字节序处理；复制一份，不改动调用方切片。
 	ordered := make([]Record, len(records))
 	copy(ordered, records)
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -31,61 +52,65 @@ func Solve(standards []string, records []Record) Result {
 	})
 
 	n := len(standards)
-	parent := make([]int, n)
-	size := make([]int, n)
-	// pot[x] = value[x] - value[parent(x)]；根的 pot 恒为 0。
-	pot := make([]int64, n)
-	for i := range parent {
-		parent[i] = i
-		size[i] = 1
+	nw := &network{
+		standards: standards,
+		index:     index,
+		ordered:   ordered,
+		parent:    make([]int, n),
+		size:      make([]int, n),
+		pot:       make([]int64, n),
+		adj:       make([][]adjEdge, n),
 	}
-
-	var find func(int) int
-	find = func(x int) int {
-		if parent[x] == x {
-			return x
-		}
-		p := parent[x]
-		root := find(p)
-		pot[x] += pot[p] // 路径压缩后 pot[x] 直连根：value[x] - value[root]
-		parent[x] = root
-		return root
+	for i := range nw.parent {
+		nw.parent[i] = i
+		nw.size[i] = 1
 	}
+	return nw
+}
 
-	// forest 仅由“连接两个不同分量”的已接受记录构成，因此始终是森林。
-	adj := make([][]adjEdge, n)
+// find 路径压缩并累加势能，返回 x 的根。
+func (nw *network) find(x int) int {
+	if nw.parent[x] == x {
+		return x
+	}
+	p := nw.parent[x]
+	root := nw.find(p)
+	nw.pot[x] += nw.pot[p] // 路径压缩后 pot[x] 直连根：value[x] - value[root]
+	nw.parent[x] = root
+	return root
+}
 
-	for ri := range ordered {
-		rec := ordered[ri]
-		a, b := index[rec.From], index[rec.To]
+// absorb 按字节序逐条处理全部记录；返回首个矛盾记录的 Conflict，
+// 全部一致时返回 nil。
+func (nw *network) absorb() *Conflict {
+	for ri := range nw.ordered {
+		rec := nw.ordered[ri]
+		a, b := nw.index[rec.From], nw.index[rec.To]
 
 		// 自比较：value[x] - value[x] 必须为 0，否则当场矛盾。
 		if a == b {
 			if rec.Delta != 0 {
-				return Result{Consistent: false, Conflict: selfConflict(rec)}
+				return selfConflict(rec)
 			}
 			continue
 		}
 
-		ra, rb := find(a), find(b)
+		ra, rb := nw.find(a), nw.find(b)
 		if ra == rb {
 			// 同分量：隐含差值 value[b]-value[a] 为 pot[b] - pot[a]。
-			implied := pot[b] - pot[a]
+			implied := nw.pot[b] - nw.pot[a]
 			if implied != rec.Delta {
-				path := forestPath(a, b, adj, ordered, standards)
-				return Result{
-					Consistent: false,
-					Conflict: &Conflict{
-						Record:       rec,
-						ImpliedDelta: implied,
-						Mismatch:     rec.Delta - implied,
-						Path:         path,
-						Loop: Loop{
-							Nodes:       loopNodes(path),
-							PathTotal:   path.Total,
-							RecordDelta: rec.Delta,
-							Sum:         path.Total - rec.Delta,
-						},
+				path := forestPath(a, b, nw.adj, nw.ordered, nw.standards)
+				return &Conflict{
+					Record:       rec,
+					ImpliedDelta: implied,
+					Mismatch:     rec.Delta - implied,
+					Path:         path,
+					Loop: Loop{
+						Nodes:       loopNodes(path),
+						PathTotal:   path.Total,
+						RecordDelta: rec.Delta,
+						Sum:         path.Total - rec.Delta,
 					},
 				}
 			}
@@ -93,52 +118,67 @@ func Solve(standards []string, records []Record) Result {
 		}
 
 		// 合并两个分量并维护势能。
-		link(a, b, ra, rb, rec.Delta, parent, size, pot)
+		nw.link(a, b, ra, rb, rec.Delta)
 
 		// 不论 ra/rb 谁挂到谁下，边在无向森林中都是同一条。
-		adj[a] = append(adj[a], adjEdge{to: b, ri: ri})
-		adj[b] = append(adj[b], adjEdge{to: a, ri: ri})
+		nw.adj[a] = append(nw.adj[a], adjEdge{to: b, ri: ri})
+		nw.adj[b] = append(nw.adj[b], adjEdge{to: a, ri: ri})
 	}
+	return nil
+}
 
-	// 全部一致：以每个连通分量中 id 最小的标准件为零点输出相对值。
+// link 按大小合并两个分量并维护势能。约束：value[b] - value[a] = delta。
+func (nw *network) link(a, b, ra, rb int, delta int64) {
+	// find 之后 pot[a] = value[a] - value[ra]，pot[b] = value[b] - value[rb]。
+	if nw.size[ra] >= nw.size[rb] {
+		// rb 挂到 ra 下，令 pot[rb] = value[rb] - value[ra]
+		// = (value[b] - pot[b]) - (value[a] - pot[a])
+		// = delta + pot[a] - pot[b]。
+		nw.parent[rb] = ra
+		nw.pot[rb] = delta + nw.pot[a] - nw.pot[b]
+		nw.size[ra] += nw.size[rb]
+	} else {
+		// ra 挂到 rb 下，令 pot[ra] = value[ra] - value[rb]
+		// = pot[b] - pot[a] - delta。
+		nw.parent[ra] = rb
+		nw.pot[ra] = nw.pot[b] - nw.pot[a] - delta
+		nw.size[rb] += nw.size[ra]
+	}
+}
+
+// connected 报告下标 a、b 是否同属一个连通分量。
+func (nw *network) connected(a, b int) bool {
+	return nw.find(a) == nw.find(b)
+}
+
+// diff 返回 value[b] - value[a]；调用方需保证 a、b 已连通。
+func (nw *network) diff(a, b int) int64 {
+	nw.find(a)
+	nw.find(b)
+	return nw.pot[b] - nw.pot[a]
+}
+
+// relativeValues 以每个连通分量中 id 最小的标准件为零点，输出全部相对值。
+func (nw *network) relativeValues() Int64Map {
+	n := len(nw.standards)
 	rootOf := make([]int, n)
 	rootMin := map[int]int{} // 各分量（以根为键）最小标准件的节点下标
-	for i := range standards {
-		r := find(i)
+	for i := range nw.standards {
+		r := nw.find(i)
 		rootOf[i] = r
-		if cur, ok := rootMin[r]; !ok || standards[i] < standards[cur] {
+		if cur, ok := rootMin[r]; !ok || nw.standards[i] < nw.standards[cur] {
 			rootMin[r] = i
 		}
 	}
 
 	values := make(Int64Map, n)
-	for i, s := range standards {
+	for i, s := range nw.standards {
 		z := rootMin[rootOf[i]]
 		// 同根：pot[i] = value[i]-value[root]，pot[z] 同理，
 		// 相对零点值 value[i]-value[z] = pot[i] - pot[z]。
-		values[s] = pot[i] - pot[z]
+		values[s] = nw.pot[i] - nw.pot[z]
 	}
-
-	return Result{Consistent: true, Values: values}
-}
-
-// link 按大小合并两个分量并维护势能。约束：value[b] - value[a] = delta。
-func link(a, b, ra, rb int, delta int64, parent, size []int, pot []int64) {
-	// find 之后 pot[a] = value[a] - value[ra]，pot[b] = value[b] - value[rb]。
-	if size[ra] >= size[rb] {
-		// rb 挂到 ra 下，令 pot[rb] = value[rb] - value[ra]
-		// = (value[b] - pot[b]) - (value[a] - pot[a])
-		// = delta + pot[a] - pot[b]。
-		parent[rb] = ra
-		pot[rb] = delta + pot[a] - pot[b]
-		size[ra] += size[rb]
-	} else {
-		// ra 挂到 rb 下，令 pot[ra] = value[ra] - value[rb]
-		// = pot[b] - pot[a] - delta。
-		parent[ra] = rb
-		pot[ra] = pot[b] - pot[a] - delta
-		size[rb] += size[ra]
-	}
+	return values
 }
 
 type adjEdge struct {

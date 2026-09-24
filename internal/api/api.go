@@ -1,5 +1,5 @@
 // Package api 提供纯后端 JSON API：POST /check 校验比较记录构成的校准网，
-// GET /healthz 做存活检查。
+// POST /correct 评估“只改一条疑似记录”能否修复整网，GET /healthz 做存活检查。
 package api
 
 import (
@@ -17,13 +17,19 @@ const (
 	minStandards = 2
 	maxStandards = 2000
 	maxRecords   = 6000
-	maxDelta     = 1_000_000_000
 )
 
 // Request 是 /check 的请求体。
 type Request struct {
 	Standards []string        `json:"standards"`
 	Records   []solver.Record `json:"records"`
+}
+
+// CorrectRequest 是 /correct 的请求体：在 /check 字段之外指定疑似记录 id。
+type CorrectRequest struct {
+	Standards []string        `json:"standards"`
+	Records   []solver.Record `json:"records"`
+	SuspectID string          `json:"suspectId"`
 }
 
 // NewHandler 构造 API 的路由处理器。
@@ -33,29 +39,61 @@ func NewHandler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /check", handleCheck)
+	mux.HandleFunc("POST /correct", handleCorrect)
 	return mux
 }
 
 func handleCheck(w http.ResponseWriter, r *http.Request) {
 	var req Request
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "invalid JSON body: "+err.Error())
+	if !decodeBody(w, r, &req) {
 		return
 	}
-	// 请求体中只允许一个 JSON 值。
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusUnprocessableEntity, "request body must contain a single JSON object")
-		return
-	}
-
 	if err := Validate(req); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, solver.Solve(req.Standards, req.Records))
+}
+
+func handleCorrect(w http.ResponseWriter, r *http.Request) {
+	var req CorrectRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if err := Validate(Request{Standards: req.Standards, Records: req.Records}); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if req.SuspectID == "" {
+		writeError(w, http.StatusUnprocessableEntity, "suspectId must be non-empty")
+		return
+	}
+
+	corr, ok := solver.Correct(req.Standards, req.Records, req.SuspectID)
+	if !ok {
+		writeError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("suspectId %q is not an existing record id", req.SuspectID))
+		return
+	}
+	writeJSON(w, http.StatusOK, corr)
+}
+
+// decodeBody 把请求体解析为单个 JSON 对象写入 v；
+// 失败时已写好 422 响应，返回 false。
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid JSON body: "+err.Error())
+		return false
+	}
+	// 请求体中只允许一个 JSON 值。
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusUnprocessableEntity, "request body must contain a single JSON object")
+		return false
+	}
+	return true
 }
 
 // Validate 只做结构与范围校验，不进入任何数值约束传播。
@@ -98,8 +136,8 @@ func Validate(req Request) error {
 		if _, ok := seen[rec.To]; !ok {
 			return fmt.Errorf("records[%d] (%s): to %q is not a known standard", i, rec.ID, rec.To)
 		}
-		if rec.Delta > maxDelta || rec.Delta < -maxDelta {
-			return fmt.Errorf("records[%d] (%s): delta %d out of range [-%d,%d]", i, rec.ID, rec.Delta, maxDelta, maxDelta)
+		if rec.Delta > solver.MaxDelta || rec.Delta < -solver.MaxDelta {
+			return fmt.Errorf("records[%d] (%s): delta %d out of range [-%d,%d]", i, rec.ID, rec.Delta, solver.MaxDelta, solver.MaxDelta)
 		}
 	}
 	return nil
